@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+venv/
+.venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Model weights and large AI models
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+models/
+weights/
+*.npy
+# Generated sensor data
+data/
+*.pcd
+*.ply
+*.las
+*.laz
+
+# Generated images and videos
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+
+# Runtime state and temporary files
+environment_state.json
+driver_state.json
+*.tmp
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build outputs
+build/
+dist/
+
+# CARLA generated files
+CarlaUE4/Saved/
+Saved/
