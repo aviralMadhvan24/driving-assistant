@@ -1,0 +1,10 @@
+carla
+opencv-python
+numpy
+torch
+transformers
+Pillow
+ultralytics
+fastapi
+uvicorn[standard]
+mediapipe

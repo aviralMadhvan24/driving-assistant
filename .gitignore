@@ -66,3 +66,5 @@ dist/
 # CARLA generated files
 CarlaUE4/Saved/
 Saved/
+*.npy
+node_modules/

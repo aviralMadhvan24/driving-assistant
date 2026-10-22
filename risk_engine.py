@@ -1,2207 +1,583 @@
-import carla
+"""
+Camera-only ADAS environment risk engine.
+CARLA RGB -> YOLO11n -> Depth Anything V2 Metric -> environment_state.json
 
-import cv2
+Run after CARLA and manual_control.py.
+Requires an ego vehicle with role_name="hero".
 
-import numpy as np
+Prototype only:
+- Depth Anything distances are estimates, not ground-truth measurements.
+- TTC and risk levels are experimental and not certified for real vehicles.
+- This script does not control brakes or steering.
+"""
 
-import math
 import json
 import os
 import time
+from pathlib import Path
 
-from collections import deque
-
+import carla
+import cv2
+import numpy as np
+import torch
+from PIL import Image
 from ultralytics import YOLO
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
-# ============================================================
+# ---------------- CONFIG ----------------
+WIDTH, HEIGHT, FOV = 640, 360, 90
+DEPTH_MODEL_NAME = "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
+YOLO_PATH = "yolo11n.pt"
+MAX_DEPTH_M = 80.0
+PROCESS_EVERY_N_FRAMES = 3
+CONFIDENCE = 0.30
+STATE_PATH = Path(__file__).resolve().parent / "environment_state.json"
 
-# CONFIG
-
-# ============================================================
-
-WIDTH = 640
-
-HEIGHT = 360
-
-FOV = 90
-
-LIDAR_RANGE = 50.0
-
-DISTANCE_ALPHA = 0.15
-
-POSITION_ALPHA = 0.30
-
-VELOCITY_HISTORY_SIZE = 6
-
-MIN_CLOSING_SPEED = 0.5
-
-TTC_CRITICAL = 1.5
-
-TTC_WARNING = 3.0
-
-TTC_CAUTION = 6.0
-
-# ------------------------------------------------------------
-
-# EGO VEHICLE / COLLISION CORRIDOR
-
-# ------------------------------------------------------------
-
-# Tesla Model 3 is approximately 1.85m wide.
-
-EGO_HALF_WIDTH = 0.93
-
-# Extra safety margin on both sides.
-
-SAFETY_MARGIN = 0.35
-
-# Maximum corridor width.
-
-MAX_CORRIDOR_HALF_WIDTH = 2.0
-
-# ------------------------------------------------------------
-
-# DISTANCE FALLBACK
-
-# ------------------------------------------------------------
-
-CRITICAL_DISTANCE = 4.0
-
-WARNING_DISTANCE = 8.0
-
-CAUTION_DISTANCE = 15.0
-
-MODEL_PATH = "yolo11n.pt"
-
-ENVIRONMENT_STATE_FILE = "environment_state.json"
-
-# Synchronized sensor processing
-SENSOR_BUFFER_SIZE = 30
-SYNC_WAIT_SLEEP = 0.001
-REQUIRE_SYNCHRONOUS_MODE = True
-
-
-def publish_environment_state(
-    overall_risk,
-    nearest_distance,
-    nearest_ttc,
-    nearest_class,
-    nearest_id
-):
-    state = {
-        "environment_risk": overall_risk,
-        "nearest_distance": (
-            None
-            if math.isinf(nearest_distance)
-            else float(nearest_distance)
-        ),
-        "nearest_ttc": (
-            None
-            if math.isinf(nearest_ttc)
-            else float(nearest_ttc)
-        ),
-        "nearest_class": nearest_class,
-        "nearest_id": int(nearest_id)
-    }
-
-    temp_file = ENVIRONMENT_STATE_FILE + ".tmp"
-
-    try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-
-        os.replace(
-            temp_file,
-            ENVIRONMENT_STATE_FILE
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-
-# GLOBALS
-
-# ============================================================
-
-latest_rgb = None
-
-latest_lidar = None
-
-latest_lidar_transform = None
-
-latest_lidar_timestamp = None
-
-rgb_frames = {}
-lidar_frames = {}
-last_processed_frame = -1
-
-filtered_distances = {}
-
-filtered_positions = {}
-
-track_history = {}
-
-# ============================================================
-
-# YOLO
-
-# ============================================================
-
-model = YOLO(MODEL_PATH)
-
-# ============================================================
-
-# CARLA CONNECTION
-
-# ============================================================
-
-client = carla.Client(
-
-    "127.0.0.1",
-
-    2000
-
+CAMERA_OFFSET = carla.Transform(
+    carla.Location(x=0.8, y=0.0, z=2.4),
+    carla.Rotation(pitch=-8.0),
 )
 
-client.set_timeout(10.0)
+# Demo thresholds only. Validate with known distances in CARLA.
+CRITICAL_DISTANCE_M = 5.0
+WARNING_DISTANCE_M = 12.0
+CAUTION_DISTANCE_M = 25.0
+CRITICAL_TTC_S = 1.5
+WARNING_TTC_S = 3.0
 
+# Camera-image collision corridor. This mirrors the two-line corridor
+# from the previous risk engine, but uses image coordinates because this
+# version does not use LiDAR. It is an approximation, not lane detection.
+EGO_HALF_WIDTH = 0.93
+SAFETY_MARGIN = 0.35
+CORRIDOR_HALF_WIDTH_BOTTOM_PX = 125
+CORRIDOR_HALF_WIDTH_TOP_PX = 38
+CORRIDOR_TOP_Y = 45
+
+# Only these detected classes are treated as road hazards for the headline risk.
+# YOLO COCO IDs: person=0, bicycle=1, car=2, motorcycle=3, bus=5,
+# train=6, truck=7, traffic light=9, stop sign=11.
+HAZARD_CLASSES = {
+    "person", "bicycle", "car", "motorcycle", "bus", "train", "truck"
+}
+
+# Match detections between frames by class and bounding-box IoU.
+MIN_TRACK_IOU = 0.15
+MIN_CLOSING_SPEED_MPS = 0.5
+MAX_TTC_S = 30.0
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[ENV] Inference device: {device}")
+print("[ENV] Loading Depth Anything V2...")
+processor = AutoImageProcessor.from_pretrained(DEPTH_MODEL_NAME)
+depth_model = AutoModelForDepthEstimation.from_pretrained(DEPTH_MODEL_NAME).to(device)
+depth_model.eval()
+
+print("[ENV] Loading YOLO...")
+yolo = YOLO(YOLO_PATH)
+yolo_device = 0 if device.type == "cuda" else "cpu"
+print("[ENV] Models loaded.")
+
+client = carla.Client("127.0.0.1", 2000)
+client.set_timeout(15)
 world = client.get_world()
 
-blueprint_library = (
 
-    world.get_blueprint_library()
+def find_ego():
+    for actor in world.get_actors().filter("vehicle.*"):
+        if actor.attributes.get("role_name") == "hero":
+            return actor
+    return None
 
-)
 
-# ============================================================
-
-# FIND EGO VEHICLE
-
-# ============================================================
-
-# ============================================================
-# FIND EGO VEHICLE
-# ============================================================
-
-# manual_control.py may need a short moment to spawn the vehicle.
-# Wait instead of failing immediately.
-
-EGO_WAIT_TIMEOUT = 15.0
-EGO_POLL_INTERVAL = 0.25
-
-ego_vehicle = None
-ego_deadline = time.time() + EGO_WAIT_TIMEOUT
-
-print("Waiting for ego vehicle...")
-
-while time.time() < ego_deadline:
-
-    vehicles = world.get_actors().filter(
-        "vehicle.*"
-    )
-
-    # Prefer the vehicle marked as hero.
-    for vehicle in vehicles:
-
-        if vehicle.attributes.get(
-            "role_name"
-        ) == "hero":
-
-            ego_vehicle = vehicle
-            break
-
-    # Fallback to Tesla Model 3.
-    if ego_vehicle is None:
-
-        for vehicle in vehicles:
-
-            if vehicle.type_id == (
-                "vehicle.tesla.model3"
-            ):
-
-                ego_vehicle = vehicle
-                break
-
-    if ego_vehicle is not None:
+ego = None
+for _ in range(30):
+    ego = find_ego()
+    if ego is not None:
         break
+    print("[ENV] Waiting for ego vehicle role_name='hero'...")
+    time.sleep(1)
 
-    time.sleep(EGO_POLL_INTERVAL)
-
-if ego_vehicle is None:
-
+if ego is None:
     raise RuntimeError(
-        "Ego vehicle was not found after "
-        f"{EGO_WAIT_TIMEOUT:.0f} seconds. "
-        "Make sure manual_control.py is running "
-        "and the vehicle is spawned."
+        "Ego vehicle not found. Start CARLA and manual_control.py first; "
+        "the vehicle must have role_name='hero'."
     )
 
-print(
-    "Ego:",
-    ego_vehicle.type_id,
-    "ID:",
-    ego_vehicle.id,
-    "role:",
-    ego_vehicle.attributes.get("role_name")
-)
+print(f"[ENV] Ego vehicle: {ego.id} ({ego.type_id})")
+
+camera_bp = world.get_blueprint_library().find("sensor.camera.rgb")
+camera_bp.set_attribute("image_size_x", str(WIDTH))
+camera_bp.set_attribute("image_size_y", str(HEIGHT))
+camera_bp.set_attribute("fov", str(FOV))
+camera = world.spawn_actor(camera_bp, CAMERA_OFFSET, attach_to=ego)
+
+latest_frame = None
+latest_frame_id = -1
+import threading
+frame_lock = threading.Lock()
 
-# ------------------------------------------------------------
-# SYNCHRONOUS MODE CHECK
-# ------------------------------------------------------------
-
-world_settings = world.get_settings()
-
-if REQUIRE_SYNCHRONOUS_MODE:
-
-    if not world_settings.synchronous_mode:
-
-        raise RuntimeError(
-            "CARLA is not in synchronous mode. "
-            "Start manual_control.py with --sync "
-            "before starting risk_engine_sync.py."
-        )
-
-    print("Synchronous mode: ON")
-
-else:
-
-    print(
-        "Synchronous mode:",
-        "ON" if world_settings.synchronous_mode else "OFF"
-    )
-
-# ============================================================
-
-# CAMERA
-
-# ============================================================
-
-camera_bp = blueprint_library.find(
-
-    "sensor.camera.rgb"
-
-)
-
-camera_bp.set_attribute(
-
-    "image_size_x",
-
-    str(WIDTH)
-
-)
-
-camera_bp.set_attribute(
-
-    "image_size_y",
-
-    str(HEIGHT)
-
-)
-
-camera_bp.set_attribute(
-
-    "fov",
-
-    str(FOV)
-
-)
-
-camera_transform = carla.Transform(
-
-    carla.Location(
-
-        x=0.8,
-
-        y=0.0,
-
-        z=2.4
-
-    ),
-
-    carla.Rotation(
-
-        pitch=-8.0,
-
-        yaw=0.0,
-
-        roll=0.0
-
-    )
-
-)
-
-camera = world.spawn_actor(
-
-    camera_bp,
-
-    camera_transform,
-
-    attach_to=ego_vehicle
-
-)
-
-# ============================================================
-
-# LIDAR
-
-# ============================================================
-
-lidar_bp = blueprint_library.find(
-
-    "sensor.lidar.ray_cast"
-
-)
-
-lidar_bp.set_attribute(
-
-    "range",
-
-    str(LIDAR_RANGE)
-
-)
-
-lidar_bp.set_attribute(
-
-    "channels",
-
-    "16"
-
-)
-
-lidar_bp.set_attribute(
-
-    "points_per_second",
-
-    "30000"
-
-)
-
-lidar_bp.set_attribute(
-
-    "rotation_frequency",
-
-    "20"
-
-)
-
-lidar_transform = carla.Transform(
-
-    carla.Location(
-
-        x=0.0,
-
-        y=0.0,
-
-        z=2.2
-
-    )
-
-)
-
-lidar = world.spawn_actor(
-
-    lidar_bp,
-
-    lidar_transform,
-
-    attach_to=ego_vehicle
-
-)
-
-# ============================================================
-
-# CAMERA CALLBACK
-
-# ============================================================
 
 def camera_callback(image):
-
-    global latest_rgb
-
-    array = np.frombuffer(
-        image.raw_data,
-        dtype=np.uint8
+    global latest_frame, latest_frame_id
+    bgra = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(
+        image.height, image.width, 4
     )
-
-    array = array.reshape(
-        image.height,
-        image.width,
-        4
-    )
-
-    rgb = array[:, :, :3].copy()
-    latest_rgb = rgb
-
-    rgb_frames[int(image.frame)] = {
-        "image": rgb,
-        "transform": image.transform,
-        "timestamp": float(image.timestamp)
-    }
-
-    if len(rgb_frames) > SENSOR_BUFFER_SIZE:
-        oldest = min(rgb_frames)
-        del rgb_frames[oldest]
+    bgr = bgra[:, :, :3].copy()
+    with frame_lock:
+        latest_frame = bgr
+        latest_frame_id = image.frame
 
 
-# ============================================================
-# LIDAR CALLBACK
-# ============================================================
+def estimate_depth(bgr):
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    inputs = processor(images=Image.fromarray(rgb), return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
 
-def lidar_callback(point_cloud):
+    with torch.inference_mode():
+        outputs = depth_model(**inputs)
+        depth = torch.nn.functional.interpolate(
+            outputs.predicted_depth.unsqueeze(1),
+            size=(HEIGHT, WIDTH),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
 
-    global latest_lidar
-    global latest_lidar_transform
-    global latest_lidar_timestamp
-
-    points = np.frombuffer(
-        point_cloud.raw_data,
-        dtype=np.float32
-    )
-
-    points = points.reshape(-1, 4).copy()
-    transform = point_cloud.transform
-
-    latest_lidar = points
-    latest_lidar_transform = transform
-    latest_lidar_timestamp = float(point_cloud.timestamp)
-
-    lidar_frames[int(point_cloud.frame)] = {
-        "points": points,
-        "transform": transform,
-        "timestamp": float(point_cloud.timestamp)
-    }
-
-    if len(lidar_frames) > SENSOR_BUFFER_SIZE:
-        oldest = min(lidar_frames)
-        del lidar_frames[oldest]
+    return depth.float().cpu().numpy()
 
 
-# ============================================================
-# SYNCHRONIZED SENSOR FRAME
-# ============================================================
+def box_depth(depth_map, box):
+    x1, y1, x2, y2 = map(int, box)
+    x1 = max(0, min(WIDTH - 1, x1))
+    x2 = max(0, min(WIDTH, x2))
+    y1 = max(0, min(HEIGHT - 1, y1))
+    y2 = max(0, min(HEIGHT, y2))
 
-def get_synchronized_sensor_frame():
-
-    global last_processed_frame
-
-    if not rgb_frames or not lidar_frames:
+    if x2 <= x1 or y2 <= y1:
         return None
 
-    common_frames = set(rgb_frames).intersection(lidar_frames)
-    common_frames = [
-        frame_id
-        for frame_id in common_frames
-        if frame_id > last_processed_frame
+    dx, dy = x2 - x1, y2 - y1
+    # Ignore box edges to reduce background pixels affecting the estimate.
+    xa = x1 + int(dx * 0.20)
+    xb = x2 - int(dx * 0.20)
+    ya = y1 + int(dy * 0.20)
+    yb = y2 - int(dy * 0.20)
+    roi = depth_map[ya:yb, xa:xb]
+
+    valid = roi[
+        np.isfinite(roi) & (roi > 0.1) & (roi <= MAX_DEPTH_M)
     ]
-
-    if not common_frames:
+    if valid.size == 0:
         return None
-
-    # Newest common frame keeps latency low while guaranteeing
-    # RGB and LiDAR belong to the same CARLA simulation frame.
-    frame_id = max(common_frames)
-
-    rgb_data = rgb_frames[frame_id]
-    lidar_data = lidar_frames[frame_id]
-    last_processed_frame = frame_id
-
-    for old_frame in list(rgb_frames):
-        if old_frame <= frame_id:
-            del rgb_frames[old_frame]
-
-    for old_frame in list(lidar_frames):
-        if old_frame <= frame_id:
-            del lidar_frames[old_frame]
-
-    return {
-        "frame_id": frame_id,
-        "rgb": rgb_data["image"],
-        "camera_transform": rgb_data["transform"],
-        "lidar": lidar_data["points"],
-        "lidar_transform": lidar_data["transform"],
-        "timestamp": rgb_data["timestamp"]
-    }
+    return float(np.median(valid))
 
 
-# ============================================================
+def box_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
 
-# START SENSORS
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
-# ============================================================
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
 
-camera.listen(
 
-    camera_callback
+# Track state: track_id -> class_name, bbox, distance, monotonic timestamp.
+tracks = {}
+next_track_id = 1
 
-)
 
-lidar.listen(
+def associate_and_update(detections, now):
+    """Greedily associate same-class boxes with the best available IoU."""
+    global next_track_id
+    candidates = []
 
-    lidar_callback
+    for det_index, det in enumerate(detections):
+        for track_id, old in tracks.items():
+            if old["class_name"] != det["class_name"]:
+                continue
+            iou = box_iou(det["bbox"], old["bbox"])
+            if iou >= MIN_TRACK_IOU:
+                candidates.append((iou, det_index, track_id))
 
-)
+    candidates.sort(reverse=True)
+    matched_dets = set()
+    matched_tracks = set()
+    assignments = {}
 
-print("Camera started.")
-
-print("LiDAR started.")
-
-print("Risk engine started.")
-
-# ============================================================
-
-# CAMERA INTRINSICS
-
-# ============================================================
-
-focal_length = WIDTH / (
-
-    2.0 *
-
-    math.tan(
-
-        math.radians(FOV) / 2.0
-
-    )
-
-)
-
-cx = WIDTH / 2.0
-
-cy = HEIGHT / 2.0
-
-K = np.array(
-
-    [
-
-        [focal_length, 0, cx],
-
-        [0, focal_length, cy],
-
-        [0, 0, 1]
-
-    ],
-
-    dtype=np.float32
-
-)
-
-# ============================================================
-
-# LIDAR → CAMERA
-
-# ============================================================
-
-def lidar_to_camera(
-    points,
-    lidar_transform,
-    camera_transform
-):
-
-    if points is None:
-
-        return []
-
-    if lidar_transform is None:
-
-        return []
-
-    if camera_transform is None:
-
-        return []
-
-    camera_inverse = np.array(
-
-        camera_transform.get_inverse_matrix()
-
-    )
-
-    projected = []
-
-    for point in points:
-
-        x, y, z = point[:3]
-
-        if not np.isfinite(x):
-
+    for iou, det_index, track_id in candidates:
+        if det_index in matched_dets or track_id in matched_tracks:
             continue
+        matched_dets.add(det_index)
+        matched_tracks.add(track_id)
+        assignments[det_index] = track_id
 
-        if not np.isfinite(y):
+    for index, det in enumerate(detections):
+        track_id = assignments.get(index)
+        if track_id is None:
+            track_id = next_track_id
+            next_track_id += 1
+            det["ttc_seconds"] = None
+        else:
+            old = tracks[track_id]
+            old_distance = old["distance_m"]
+            dt = now - old["time"]
 
-            continue
-
-        if not np.isfinite(z):
-
-            continue
-
-        location = (
-
-            lidar_transform.transform(
-
-                carla.Location(
-
-                    x=float(x),
-
-                    y=float(y),
-
-                    z=float(z)
-
-                )
-
+            ttc = None
+            if (
+                det["distance_m"] is not None
+                and old_distance is not None
+                and dt > 0.05
+            ):
+                # Smoothly reject implausibly large single-frame changes.
+                closing_speed = (old_distance - det["distance_m"]) / dt
+                if MIN_CLOSING_SPEED_MPS < closing_speed < 100.0:
+                    estimated_ttc = det["distance_m"] / closing_speed
+                    if 0 <= estimated_ttc <= MAX_TTC_S:
+                        ttc = estimated_ttc
+            det["ttc_seconds"] = (
+                round(float(ttc), 2) if ttc is not None else None
             )
 
-        )
-
-        world_point = np.array(
-
-            [
-
-                location.x,
-
-                location.y,
-
-                location.z,
-
-                1.0
-
-            ],
-
-            dtype=np.float32
-
-        )
-
-        camera_point = (
-
-            camera_inverse @ world_point
-
-        )[:3]
-
-        if not np.all(
-
-            np.isfinite(camera_point)
-
-        ):
-
-            continue
-
-        # CARLA camera:
-
-        # X = forward
-
-        # Y = right
-
-        # Z = up
-
-        #
-
-        # OpenCV:
-
-        # X = right
-
-        # Y = down
-
-        # Z = forward
-
-        x_cv = camera_point[1]
-
-        y_cv = -camera_point[2]
-
-        z_cv = camera_point[0]
-
-        if z_cv <= 0.1:
-
-            continue
-
-        pixel = K @ np.array(
-
-            [
-
-                x_cv,
-
-                y_cv,
-
-                z_cv
-
-            ],
-
-            dtype=np.float32
-
-        )
-
-        if abs(pixel[2]) < 1e-6:
-
-            continue
-
-        u = pixel[0] / pixel[2]
-
-        v = pixel[1] / pixel[2]
-
-        if not np.isfinite(u):
-
-            continue
-
-        if not np.isfinite(v):
-
-            continue
-
-        u = int(u)
-
-        v = int(v)
-
-        if (
-
-            0 <= u < WIDTH
-
-            and
-
-            0 <= v < HEIGHT
-
-        ):
-
-            projected.append(
-
-                (
-
-                    u,
-
-                    v,
-
-                    x,
-
-                    y,
-
-                    z
-
-                )
-
-            )
-
-    return projected
-
-# ============================================================
-
-# GET OBJECT LIDAR DATA
-
-# ============================================================
-
-def get_lidar_object_data(
-
-    bbox,
-
-    projected_points
-
-):
-
-    x1, y1, x2, y2 = bbox
-
-    points = []
-
-    for point in projected_points:
-
-        u, v, x, y, z = point
-
-        if (
-
-            x1 <= u <= x2
-
-            and
-
-            y1 <= v <= y2
-
-        ):
-
-            points.append(
-
-                (
-
-                    x,
-
-                    y,
-
-                    z
-
-                )
-
-            )
-
-    if len(points) < 3:
-
-        return None
-
-    points = np.array(
-
-        points,
-
-        dtype=np.float32
-
-    )
-
-    # --------------------------------------------------------
-
-    # Remove LiDAR outliers
-
-    # --------------------------------------------------------
-
-    median = np.median(
-
-        points,
-
-        axis=0
-
-    )
-
-    distances = np.linalg.norm(
-
-        points - median,
-
-        axis=1
-
-    )
-
-    points = points[
-
-        distances < 3.0
-
-    ]
-
-    if len(points) < 3:
-
-        return None
-
-    # --------------------------------------------------------
-
-    # Object center
-
-    # --------------------------------------------------------
-
-    x = float(
-
-        np.median(points[:, 0])
-
-    )
-
-    y = float(
-
-        np.median(points[:, 1])
-
-    )
-
-    z = float(
-
-        np.median(points[:, 2])
-
-    )
-
-    # --------------------------------------------------------
-
-    # Object lateral extent
-
-    # --------------------------------------------------------
-
-    y_min = float(
-
-        np.percentile(
-
-            points[:, 1],
-
-            10
-
-        )
-
-    )
-
-    y_max = float(
-
-        np.percentile(
-
-            points[:, 1],
-
-            90
-
-        )
-
-    )
-
-    object_half_width = (
-
-        y_max - y_min
-
-    ) / 2.0
-
-    # Avoid unrealistically tiny widths.
-
-    object_half_width = max(
-
-        object_half_width,
-
-        0.25
-
-    )
-
-    # --------------------------------------------------------
-
-    # Distance
-
-    # --------------------------------------------------------
-
-    distance = math.sqrt(
-
-        x * x +
-
-        y * y +
-
-        z * z
-
-    )
-
-    return {
-
-        "x": x,
-
-        "y": y,
-
-        "z": z,
-
-        "distance": distance,
-
-        "y_min": y_min,
-
-        "y_max": y_max,
-
-        "object_half_width":
-
-            object_half_width,
-
-        "points": len(points)
-
-    }
-
-# ============================================================
-
-# POSITION SMOOTHING
-
-# ============================================================
-
-def smooth_position(
-
-    key,
-
-    x,
-
-    y,
-
-    z
-
-):
-
-    previous = filtered_positions.get(
-
-        key
-
-    )
-
-    if previous is None:
-
-        filtered_positions[key] = (
-
-            x,
-
-            y,
-
-            z
-
-        )
-
-        return x, y, z
-
-    px, py, pz = previous
-
-    sx = (
-
-        POSITION_ALPHA * x
-
-        +
-
-        (1.0 - POSITION_ALPHA) * px
-
-    )
-
-    sy = (
-
-        POSITION_ALPHA * y
-
-        +
-
-        (1.0 - POSITION_ALPHA) * py
-
-    )
-
-    sz = (
-
-        POSITION_ALPHA * z
-
-        +
-
-        (1.0 - POSITION_ALPHA) * pz
-
-    )
-
-    filtered_positions[key] = (
-
-        sx,
-
-        sy,
-
-        sz
-
-    )
-
-    return sx, sy, sz
-
-# ============================================================
-
-# DISTANCE SMOOTHING
-
-# ============================================================
-
-def smooth_distance(
-
-    key,
-
-    distance
-
-):
-
-    previous = filtered_distances.get(
-
-        key
-
-    )
-
-    if previous is None:
-
-        filtered_distances[key] = (
-
-            distance
-
-        )
-
-        return distance
-
-    value = (
-
-        DISTANCE_ALPHA * distance
-
-        +
-
-        (1.0 - DISTANCE_ALPHA) * previous
-
-    )
-
-    filtered_distances[key] = value
-
-    return value
-
-# ============================================================
-
-# VELOCITY
-
-# ============================================================
-
-def calculate_velocity(
-
-    key,
-
-    x,
-
-    timestamp
-
-):
-
-    if key not in track_history:
-
-        track_history[key] = deque(
-
-            maxlen=VELOCITY_HISTORY_SIZE
-
-        )
-
-    history = track_history[key]
-
-    history.append(
-
-        (
-
-            timestamp,
-
-            x
-
-        )
-
-    )
-
-    if len(history) < 3:
-
-        return 0.0
-
-    t1, x1 = history[0]
-
-    t2, x2 = history[-1]
-
-    dt = t2 - t1
-
-    if dt <= 0.05:
-
-        return 0.0
-
-    # Positive = object getting closer
-
-    closing_speed = (
-
-        x1 - x2
-
-    ) / dt
-
-    closing_speed = float(
-
-        np.clip(
-
-            closing_speed,
-
-            -30.0,
-
-            30.0
-
-        )
-
-    )
-
-    if abs(closing_speed) < 0.3:
-
-        closing_speed = 0.0
-
-    return closing_speed
-
-# ============================================================
-
-# TTC
-
-# ============================================================
-
-def calculate_ttc(
-
-    distance,
-
-    closing_speed
-
-):
-
-    if closing_speed <= 0.3:
-
-        return float("inf")
-
-    if distance <= 0:
-
-        return 0.0
-
-    return distance / closing_speed
-
-# ============================================================
-
-# COLLISION CORRIDOR
-
-# ============================================================
-
-def is_in_collision_corridor(
-
-    object_y_min,
-
-    object_y_max,
-
-    object_half_width
-
-):
-
-    # --------------------------------------------------------
-
-    # Ego vehicle occupies:
-
-    #
-
-    # -EGO_HALF_WIDTH → +EGO_HALF_WIDTH
-
-    # --------------------------------------------------------
-
-    ego_left = (
-
-        -EGO_HALF_WIDTH
-
-        -
-
-        SAFETY_MARGIN
-
-    )
-
-    ego_right = (
-
-        EGO_HALF_WIDTH
-
-        +
-
-        SAFETY_MARGIN
-
-    )
-
-    # --------------------------------------------------------
-
-    # Object occupies:
-
-    #
-
-    # object_y_min → object_y_max
-
-    # --------------------------------------------------------
-
-    object_left = object_y_min
-
-    object_right = object_y_max
-
-    # --------------------------------------------------------
-
-    # Check interval overlap
-
-    # --------------------------------------------------------
-
-    overlap = (
-
-        object_right >= ego_left
-
-        and
-
-        object_left <= ego_right
-
-    )
-
-    return overlap
-
-# ============================================================
-
-# RISK ENGINE
-
-# ============================================================
-
-def calculate_risk(
-
-    distance,
-
-    ttc,
-
-    closing_speed,
-
-    in_corridor
-
-):
-
-    # --------------------------------------------------------
-
-    # NOT IN PATH
-
-    # --------------------------------------------------------
-
-    if not in_corridor:
-
-        return "SAFE"
-
-    # --------------------------------------------------------
-
-    # VERY CLOSE
-
-    # --------------------------------------------------------
-
-    if distance <= CRITICAL_DISTANCE:
-
-        return "CRITICAL"
-
-    # --------------------------------------------------------
-
-    # TTC
-
-    # --------------------------------------------------------
-
-    if ttc < TTC_CRITICAL:
-
-        return "CRITICAL"
-
-    if ttc < TTC_WARNING:
-
-        return "WARNING"
-
-    if ttc < TTC_CAUTION:
-
-        return "CAUTION"
-
-    # --------------------------------------------------------
-
-    # DISTANCE FALLBACK
-
-    # --------------------------------------------------------
-
-    if distance <= WARNING_DISTANCE:
-
-        return "WARNING"
-
-    if distance <= CAUTION_DISTANCE:
-
-        return "CAUTION"
-
-    return "SAFE"
-
-# ============================================================
-
-# COLORS
-
-# ============================================================
-
-def risk_color(risk):
-
-    if risk == "CRITICAL":
-
-        return (0, 0, 255)
-
-    if risk == "WARNING":
-
-        return (0, 140, 255)
-
-    if risk == "CAUTION":
-
-        return (0, 220, 255)
-
-    return (0, 220, 0)
-
-# ============================================================
-
-# MAIN LOOP
-
-# ============================================================
-
-try:
-
-    while True:
-
-        synchronized = get_synchronized_sensor_frame()
-
-        if synchronized is None:
-            time.sleep(SYNC_WAIT_SLEEP)
-            continue
-
-        frame_id = synchronized["frame_id"]
-        frame = synchronized["rgb"].copy()
-        lidar_points = synchronized["lidar"]
-        camera_transform_frame = synchronized["camera_transform"]
-        lidar_transform_frame = synchronized["lidar_transform"]
-        timestamp = synchronized["timestamp"]
-
-        # YOLO + BYTE TRACK
-
-        # ----------------------------------------------------
-
-        results = model.track(
-
-            frame,
-
-            persist=True,
-
-            tracker="bytetrack.yaml",
-
-            verbose=False
-
-        )
-
-        if not results:
-
-            continue
-
-        result = results[0]
-
-        boxes = result.boxes
-
-        projected_points = (
-
-            lidar_to_camera(
-
-                synchronized["lidar"],
-
-                lidar_transform_frame,
-
-                camera_transform_frame
-
-            )
-
-        )
-
-        overall_risk = "SAFE"
-        nearest_distance = float("inf")
-        nearest_ttc = float("inf")
-        nearest_class = "NONE"
-        nearest_id = -1
-
-        priority = {
-
-            "SAFE": 0,
-
-            "CAUTION": 1,
-
-            "WARNING": 2,
-
-            "CRITICAL": 3
-
+        det["track_id"] = track_id
+        tracks[track_id] = {
+            "class_name": det["class_name"],
+            "bbox": det["bbox"],
+            "distance_m": det["distance_m"],
+            "time": now,
         }
 
-        # ----------------------------------------------------
-
-        # PROCESS OBJECTS
-
-        # ----------------------------------------------------
-
-        if boxes is not None:
-
-            for box in boxes:
-
-                if box.id is None:
-
-                    continue
-
-                track_id = int(
-
-                    box.id[0]
-
-                )
-
-                class_id = int(
-
-                    box.cls[0]
-
-                )
-
-                confidence = float(
-
-                    box.conf[0]
-
-                )
-
-                class_name = (
-
-                    model.names[class_id]
-
-                )
-
-                allowed_classes = {
-
-                    "car",
-
-                    "truck",
-
-                    "bus",
-
-                    "motorcycle",
-
-                    "bicycle",
-
-                    "person"
-
-                }
-
-                if class_name not in (
-
-                    allowed_classes
-
-                ):
-
-                    continue
-
-                x1, y1, x2, y2 = map(
-
-                    int,
-
-                    box.xyxy[0]
-
-                )
-
-                key = (
-
-                    class_name,
-
-                    track_id
-
-                )
-
-                # ------------------------------------------------
-
-                # LIDAR DATA
-
-                # ------------------------------------------------
-
-                lidar_data = (
-
-                    get_lidar_object_data(
-
-                        (
-
-                            x1,
-
-                            y1,
-
-                            x2,
-
-                            y2
-
-                        ),
-
-                        projected_points
-
-                    )
-
-                )
-
-                if lidar_data is None:
-
-                    continue
-
-                x = lidar_data["x"]
-
-                y = lidar_data["y"]
-
-                z = lidar_data["z"]
-
-                distance = (
-
-                    lidar_data["distance"]
-
-                )
-
-                y_min = (
-
-                    lidar_data["y_min"]
-
-                )
-
-                y_max = (
-
-                    lidar_data["y_max"]
-
-                )
-
-                object_half_width = (
-
-                    lidar_data[
-
-                        "object_half_width"
-
-                    ]
-
-                )
-
-                # ------------------------------------------------
-
-                # SMOOTH POSITION
-
-                # ------------------------------------------------
-
-                smooth_x, smooth_y, smooth_z = (
-
-                    smooth_position(
-
-                        key,
-
-                        x,
-
-                        y,
-
-                        z
-
-                    )
-
-                )
-
-                # ------------------------------------------------
-
-                # SMOOTH DISTANCE
-
-                # ------------------------------------------------
-
-                smooth_dist = (
-
-                    smooth_distance(
-
-                        key,
-
-                        distance
-
-                    )
-
-                )
-
-                # ------------------------------------------------
-
-                # VELOCITY
-
-                # ------------------------------------------------
-
-                closing_speed = (
-
-                    calculate_velocity(
-
-                        key,
-
-                        smooth_x,
-
-                        timestamp
-
-                    )
-
-                )
-
-                # ------------------------------------------------
-
-                # TTC
-
-                # ------------------------------------------------
-
-                ttc = calculate_ttc(
-
-                    smooth_dist,
-
-                    closing_speed
-
-                )
-
-                # ------------------------------------------------
-
-                # COLLISION CORRIDOR
-
-                # ------------------------------------------------
-
-                in_corridor = (
-
-                    is_in_collision_corridor(
-
-                        y_min,
-
-                        y_max,
-
-                        object_half_width
-
-                    )
-
-                )
-
-                # ------------------------------------------------
-
-                # RISK
-
-                # ------------------------------------------------
-
-                risk = calculate_risk(
-
-                    smooth_dist,
-
-                    ttc,
-
-                    closing_speed,
-
-                    in_corridor
-
-                )
-
-                # Track the nearest object that is actually
-                # inside the collision corridor.
-                if (
-                    in_corridor
-                    and smooth_dist < nearest_distance
-                ):
-                    nearest_distance = smooth_dist
-                    nearest_ttc = ttc
-                    nearest_class = class_name
-                    nearest_id = track_id
-
-                if priority[risk] > priority[
-
-                    overall_risk
-
-                ]:
-
-                    overall_risk = risk
-
-                color = risk_color(
-
-                    risk
-
-                )
-
-                # ------------------------------------------------
-
-                # DRAW BOUNDING BOX
-
-                # ------------------------------------------------
-
-                cv2.rectangle(
-
-                    frame,
-
-                    (x1, y1),
-
-                    (x2, y2),
-
-                    color,
-
-                    2
-
-                )
-
-                # ------------------------------------------------
-
-                # TEXT
-
-                # ------------------------------------------------
-
-                if math.isinf(ttc):
-
-                    ttc_text = "INF"
-
-                else:
-
-                    ttc_text = (
-
-                        f"{ttc:.1f}s"
-
-                    )
-
-                corridor_text = (
-
-                    "PATH"
-
-                    if in_corridor
-
-                    else "SIDE"
-
-                )
-
-                text_1 = (
-
-                    f"ID:{track_id} "
-
-                    f"{class_name}"
-
-                )
-
-                text_2 = (
-
-                    f"D:{smooth_dist:.1f}m "
-
-                    f"V:{closing_speed:.1f}"
-
-                )
-
-                text_3 = (
-
-                    f"TTC:{ttc_text} "
-
-                    f"{risk}"
-
-                )
-
-                text_4 = (
-
-                    f"{corridor_text} "
-
-                    f"Y:{smooth_y:.1f}"
-
-                )
-
-                cv2.putText(
-
-                    frame,
-
-                    text_1,
-
-                    (
-
-                        x1,
-
-                        max(15, y1 - 58)
-
-                    ),
-
-                    cv2.FONT_HERSHEY_SIMPLEX,
-
-                    0.43,
-
-                    color,
-
-                    2
-
-                )
-
-                cv2.putText(
-
-                    frame,
-
-                    text_2,
-
-                    (
-
-                        x1,
-
-                        max(30, y1 - 42)
-
-                    ),
-
-                    cv2.FONT_HERSHEY_SIMPLEX,
-
-                    0.43,
-
-                    color,
-
-                    2
-
-                )
-
-                cv2.putText(
-
-                    frame,
-
-                    text_3,
-
-                    (
-
-                        x1,
-
-                        max(45, y1 - 26)
-
-                    ),
-
-                    cv2.FONT_HERSHEY_SIMPLEX,
-
-                    0.43,
-
-                    color,
-
-                    2
-
-                )
-
-                cv2.putText(
-
-                    frame,
-
-                    text_4,
-
-                    (
-
-                        x1,
-
-                        max(60, y1 - 10)
-
-                    ),
-
-                    cv2.FONT_HERSHEY_SIMPLEX,
-
-                    0.43,
-
-                    color,
-
-                    2
-
-                )
-
-        # ====================================================
-
-        publish_environment_state(
-            overall_risk, nearest_distance, nearest_ttc,
-            nearest_class, nearest_id
+    # Prevent the track dictionary growing indefinitely.
+    stale_ids = [
+        track_id for track_id, item in tracks.items()
+        if now - item["time"] > 2.0
+    ]
+    for track_id in stale_ids:
+        tracks.pop(track_id, None)
+
+
+def corridor_bounds_at_y(y):
+    """Return left/right image x-coordinates of the two-line corridor at y."""
+    y = int(np.clip(y, CORRIDOR_TOP_Y, HEIGHT - 1))
+    ratio = (y - CORRIDOR_TOP_Y) / max(1, (HEIGHT - 1 - CORRIDOR_TOP_Y))
+    half_width = (
+        CORRIDOR_HALF_WIDTH_TOP_PX
+        + ratio * (
+            CORRIDOR_HALF_WIDTH_BOTTOM_PX
+            - CORRIDOR_HALF_WIDTH_TOP_PX
         )
+    )
+    center = WIDTH // 2
+    return int(center - half_width), int(center + half_width)
 
-        # DRAW COLLISION CORRIDOR
 
-        # ====================================================
+def is_in_collision_corridor(bbox):
+    """Approximate whether a detected object overlaps the forward corridor."""
+    x1, y1, x2, y2 = bbox
+    # Test the object's lower-middle point, closer to its road-contact region.
+    sample_y = int(y1 + 0.80 * max(0, y2 - y1))
+    left, right = corridor_bounds_at_y(sample_y)
+    # Any horizontal overlap between the box and corridor counts as in-path.
+    return x2 >= left and x1 <= right
 
-        corridor_width = int(
 
-            (
+def risk_for(distance, ttc):
+    """Simple demo thresholds, not a certified collision prediction."""
+    if ttc is not None and ttc <= CRITICAL_TTC_S:
+        return "CRITICAL"
+    if distance is not None and distance <= CRITICAL_DISTANCE_M:
+        return "CRITICAL"
+    if ttc is not None and ttc <= WARNING_TTC_S:
+        return "WARNING"
+    if distance is not None and distance <= WARNING_DISTANCE_M:
+        return "WARNING"
+    if distance is not None and distance <= CAUTION_DISTANCE_M:
+        return "CAUTION"
+    if distance is None:
+        return "UNKNOWN"
+    return "SAFE"
 
-                EGO_HALF_WIDTH
 
-                +
+def risk_color(risk):
+    return {
+        "SAFE": (50, 190, 50),
+        "CAUTION": (0, 200, 255),
+        "WARNING": (0, 140, 255),
+        "CRITICAL": (0, 0, 255),
+        "UNKNOWN": (180, 180, 180),
+    }.get(risk, (180, 180, 180))
 
-                SAFETY_MARGIN
 
+def publish(state):
+    temp = STATE_PATH.with_suffix(".json.tmp")
+    temp.write_text(
+        json.dumps(state, allow_nan=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp, STATE_PATH)
+
+
+camera.listen(camera_callback)
+print("[ENV] RGB camera attached to ego vehicle.")
+print("[ENV] Press Q in the vision window to stop.")
+last_frame_id = -1
+processed = 0
+last_log_time = 0.0
+
+try:
+    while True:
+        with frame_lock:
+            frame = latest_frame.copy() if latest_frame is not None else None
+            frame_id = latest_frame_id
+
+        if frame is None or frame_id == last_frame_id:
+            time.sleep(0.005)
+            continue
+
+        last_frame_id = frame_id
+        if frame_id % PROCESS_EVERY_N_FRAMES != 0:
+            continue
+
+        depth_map = estimate_depth(frame)
+        result = yolo.predict(
+            frame,
+            imgsz=640,
+            conf=CONFIDENCE,
+            device=yolo_device,
+            verbose=False,
+        )[0]
+
+        annotated = frame.copy()
+        detections = []
+        now = time.monotonic()
+
+        if result.boxes is not None:
+            for box in result.boxes:
+                coords = box.xyxy[0].detach().cpu().numpy()
+                x1, y1, x2, y2 = map(int, coords)
+                class_id = int(box.cls[0].item())
+                class_name = str(yolo.names[class_id])
+                confidence = float(box.conf[0].item())
+                distance = box_depth(depth_map, coords)
+
+                detections.append({
+                    "class_name": class_name,
+                    "class_id": class_id,
+                    "distance_m": round(distance, 2) if distance is not None else None,
+                    "ttc_seconds": None,
+                    "bbox": [x1, y1, x2, y2],
+                    "confidence": round(confidence, 3),
+                })
+
+        associate_and_update(detections, now)
+
+        # Evaluate road hazards against the forward collision corridor.
+        hazards = [
+            det for det in detections
+            if det["class_name"] in HAZARD_CLASSES
+        ]
+        for det in detections:
+            det["in_corridor"] = (
+                det["class_name"] in HAZARD_CLASSES
+                and is_in_collision_corridor(det["bbox"])
+            )
+            det["risk_level"] = (
+                risk_for(det["distance_m"], det["ttc_seconds"])
+                if det["in_corridor"]
+                else "SAFE"
             )
 
-            /
-
-            10.0
-
-            *
-
-            WIDTH
-
+        in_path_hazards = [
+            det for det in hazards if det["in_corridor"]
+        ]
+        measurable_in_path = [
+            det for det in in_path_hazards
+            if det["distance_m"] is not None
+        ]
+        nearest = (
+            min(measurable_in_path, key=lambda det: det["distance_m"])
+            if measurable_in_path else None
         )
 
-        corridor_center = WIDTH // 2
+        if nearest is None:
+            # If a road hazard is in the corridor but depth failed, don't
+            # claim SAFE: the risk cannot be assessed from this frame.
+            overall_risk = "UNKNOWN" if in_path_hazards else "SAFE"
+            nearest_distance = None
+            nearest_ttc = None
+            nearest_class = (
+                in_path_hazards[0]["class_name"]
+                if in_path_hazards else "NONE"
+            )
+            nearest_track_id = (
+                in_path_hazards[0]["track_id"]
+                if in_path_hazards else None
+            )
+        else:
+            nearest_distance = nearest["distance_m"]
+            nearest_ttc = nearest["ttc_seconds"]
+            nearest_class = nearest["class_name"]
+            nearest_track_id = nearest["track_id"]
+            # Worst risk among objects in the corridor only.
+            risk_rank = {
+                "SAFE": 0, "CAUTION": 1, "WARNING": 2,
+                "CRITICAL": 3, "UNKNOWN": -1
+            }
+            overall_risk = max(
+                (det["risk_level"] for det in measurable_in_path),
+                key=lambda value: risk_rank[value],
+            )
 
-        corridor_left = (
+        # Draw boxes. Risk coloring applies to road hazards.
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            if det["class_name"] in HAZARD_CLASSES:
+                level = det["risk_level"]
+            else:
+                level = "SAFE"
+            color = risk_color(level)
+            distance_text = (
+                f'{det["distance_m"]:.1f}m'
+                if det["distance_m"] is not None else "depth N/A"
+            )
+            path_text = "PATH" if det["in_corridor"] else "SIDE"
+            label = f'{det["class_name"]} {distance_text} {path_text} {det["confidence"]:.2f}'
+            if det["ttc_seconds"] is not None:
+                label += f' TTC {det["ttc_seconds"]:.1f}s'
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(
+                annotated, label, (x1, max(18, y1 - 7)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
+            )
 
-            corridor_center
+        # DRAW HIGH-VISIBILITY COLLISION CORRIDOR (two thick lines)
+        # Draw after boxes so the guides cannot disappear behind detections.
+        center_x = WIDTH // 2
+        left_bottom = (center_x - CORRIDOR_HALF_WIDTH_BOTTOM_PX, HEIGHT - 2)
+        left_top = (center_x - CORRIDOR_HALF_WIDTH_TOP_PX, CORRIDOR_TOP_Y)
+        right_bottom = (center_x + CORRIDOR_HALF_WIDTH_BOTTOM_PX, HEIGHT - 2)
+        right_top = (center_x + CORRIDOR_HALF_WIDTH_TOP_PX, CORRIDOR_TOP_Y)
 
-            -
+        # Lightly tint the corridor, then draw a dark outline and bright yellow line.
+        overlay = annotated.copy()
+        corridor_poly = np.array([left_bottom, left_top, right_top, right_bottom], dtype=np.int32)
+        cv2.fillPoly(overlay, [corridor_poly], (0, 220, 255))
+        annotated = cv2.addWeighted(overlay, 0.10, annotated, 0.90, 0)
+        cv2.line(annotated, left_bottom, left_top, (0, 0, 0), 8, cv2.LINE_AA)
+        cv2.line(annotated, right_bottom, right_top, (0, 0, 0), 8, cv2.LINE_AA)
+        cv2.line(annotated, left_bottom, left_top, (0, 255, 255), 4, cv2.LINE_AA)
+        cv2.line(annotated, right_bottom, right_top, (0, 255, 255), 4, cv2.LINE_AA)
+        cv2.putText(annotated, "ESTIMATED COLLISION PATH", (center_x - 130, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2, cv2.LINE_AA)
 
-            corridor_width
-
-        )
-
-        corridor_right = (
-
-            corridor_center
-
-            +
-
-            corridor_width
-
-        )
-
-        # Only draw subtle corridor lines
-
-        cv2.line(
-
-            frame,
-
-            (
-
-                corridor_left,
-
-                HEIGHT
-
-            ),
-
-            (
-
-                corridor_center - 25,
-
-                45
-
-            ),
-
-            (100, 100, 100),
-
-            1
-
-        )
-
-        cv2.line(
-
-            frame,
-
-            (
-
-                corridor_right,
-
-                HEIGHT
-
-            ),
-
-            (
-
-                corridor_center + 25,
-
-                45
-
-            ),
-
-            (100, 100, 100),
-
-            1
-
-        )
-
-        # ====================================================
-
-        # TOP HUD
-
-        # ====================================================
-
-        color = risk_color(
-
-            overall_risk
-
-        )
-
-        cv2.rectangle(
-
-            frame,
-
-            (0, 0),
-
-            (WIDTH, 45),
-
-            (20, 20, 20),
-
-            -1
-
-        )
-
-        cv2.putText(
-
-            frame,
-
-            f"ADAS RISK: {overall_risk}",
-
-            (10, 30),
-
-            cv2.FONT_HERSHEY_SIMPLEX,
-
-            0.7,
-
-            color,
-
-            2
-
-        )
-
-        # ====================================================
-
-        # LARGE WARNING
-
-        # ====================================================
+        # High-visibility status HUD and collision-warning banners.
+        banner_color = risk_color(overall_risk)
+        cv2.rectangle(annotated, (0, 0), (WIDTH, 40), (15, 15, 15), -1)
+        cv2.putText(annotated, f"ADAS RISK: {overall_risk}", (10, 27),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, banner_color, 2, cv2.LINE_AA)
 
         if overall_risk == "CRITICAL":
-
-            cv2.rectangle(
-
-                frame,
-
-                (90, 125),
-
-                (550, 210),
-
-                (0, 0, 255),
-
-                -1
-
-            )
-
-            cv2.putText(
-
-                frame,
-
-                "!! COLLISION WARNING !!",
-
-                (115, 178),
-
-                cv2.FONT_HERSHEY_SIMPLEX,
-
-                0.78,
-
-                (255, 255, 255),
-
-                2
-
-            )
-
+            cv2.rectangle(annotated, (35, 125), (WIDTH - 35, 205), (0, 0, 220), -1)
+            cv2.rectangle(annotated, (35, 125), (WIDTH - 35, 205), (255, 255, 255), 2)
+            cv2.putText(annotated, "!! COLLISION WARNING !!", (65, 158),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(annotated, "IMMEDIATE HAZARD IN ESTIMATED PATH", (70, 188),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
         elif overall_risk == "WARNING":
-
-            cv2.rectangle(
-
-                frame,
-
-                (185, 140),
-
-                (455, 200),
-
-                (0, 140, 255),
-
-                -1
-
-            )
-
-            cv2.putText(
-
-                frame,
-
-                "WARNING",
-
-                (260, 180),
-
-                cv2.FONT_HERSHEY_SIMPLEX,
-
-                0.8,
-
-                (255, 255, 255),
-
-                2
-
-            )
-
+            cv2.rectangle(annotated, (105, 135), (WIDTH - 105, 195), (0, 110, 255), -1)
+            cv2.putText(annotated, "WARNING - HAZARD AHEAD", (125, 173),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
         elif overall_risk == "CAUTION":
+            cv2.rectangle(annotated, (190, 140), (450, 190), (0, 160, 220), -1)
+            cv2.putText(annotated, "CAUTION", (250, 174),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
-            cv2.putText(
+        if nearest_distance is not None:
+            detail = f"Nearest in-path: {nearest_class} | {nearest_distance:.1f} m"
+            if nearest_ttc is not None:
+                detail += f" | TTC {nearest_ttc:.1f} s"
+        elif in_path_hazards:
+            detail = "HAZARD IN PATH - DISTANCE UNAVAILABLE"
+        else:
+            detail = "No detected hazard in estimated path"
+        cv2.rectangle(annotated, (0, HEIGHT - 30), (WIDTH, HEIGHT), (15, 15, 15), -1)
+        cv2.putText(annotated, detail, (8, HEIGHT - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1, cv2.LINE_AA)
 
-                frame,
+        state = {
+            "source": "rgb_depth_anything_v2",
+            "timestamp": time.time(),
+            "frame_id": int(frame_id),
+            "camera_fps": None,
+            "environment_risk": overall_risk,
+            "risk_level": overall_risk,
+            "nearest_distance": nearest_distance,
+            "nearest_ttc": nearest_ttc,
+            "ttc": nearest_ttc,
+            "nearest_class": nearest_class,
+            "nearest_object": nearest_class,
+            "nearest_id": nearest_track_id,
+            "closing_speed": None,
+            "object_count": len(detections),
+            "hazard_count": len(hazards),
+            "in_corridor_count": len(in_path_hazards),
+            "collision_corridor": {
+                "method": "approximate image-space trapezoid",
+                "left_bottom_x": WIDTH // 2 - CORRIDOR_HALF_WIDTH_BOTTOM_PX,
+                "right_bottom_x": WIDTH // 2 + CORRIDOR_HALF_WIDTH_BOTTOM_PX,
+                "left_top_x": WIDTH // 2 - CORRIDOR_HALF_WIDTH_TOP_PX,
+                "right_top_x": WIDTH // 2 + CORRIDOR_HALF_WIDTH_TOP_PX,
+                "top_y": CORRIDOR_TOP_Y,
+            },
+            "detected_objects": detections,
+            "depth_method": "Depth Anything V2 Metric Outdoor Small",
+            "distance_unit": "meters",
+            "risk_thresholds_demo": {
+                "critical_distance_m": CRITICAL_DISTANCE_M,
+                "warning_distance_m": WARNING_DISTANCE_M,
+                "caution_distance_m": CAUTION_DISTANCE_M,
+                "critical_ttc_seconds": CRITICAL_TTC_S,
+                "warning_ttc_seconds": WARNING_TTC_S,
+            },
+        }
 
-                "CAUTION",
+        publish(state)
 
-                (260, 180),
-
-                cv2.FONT_HERSHEY_SIMPLEX,
-
-                0.8,
-
-                (0, 220, 255),
-
-                2
-
-            )
-
-        # ====================================================
-
-        # DISPLAY
-
-        # ====================================================
-
-        cv2.imshow(
-
-            "ADAS Risk Engine",
-
-            frame
-
+        depth_visual = (
+            np.clip(depth_map / MAX_DEPTH_M, 0, 1) * 255
+        ).astype(np.uint8)
+        depth_colored = cv2.applyColorMap(depth_visual, cv2.COLORMAP_TURBO)
+        cv2.putText(
+            depth_colored, "AI depth visualization (0-80m scale)",
+            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+            (255, 255, 255), 1, cv2.LINE_AA,
         )
+        # Separate full-size windows keep the corridor lines clearly visible.
+        cv2.imshow("ADAS Risk Engine - COLLISION PATH", annotated)
+        cv2.imshow("ADAS AI Depth Map", depth_colored)
 
-        key = cv2.waitKey(1)
+        processed += 1
+        if time.time() - last_log_time >= 1.0:
+            print(
+                f"[ENV] frame={frame_id} objects={len(detections)} "
+                f"hazards={len(hazards)} in_path={len(in_path_hazards)} "
+                f"nearest={nearest_distance}m "
+                f"TTC={nearest_ttc} risk={overall_risk}"
+            )
+            last_log_time = time.time()
 
-        if key == ord("q"):
-
+        if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
 finally:
-
-    print(
-
-        "Stopping sensors..."
-
-    )
-
-    camera.stop()
-
-    lidar.stop()
-
-    camera.destroy()
-
-    lidar.destroy()
-
+    try:
+        camera.stop()
+        camera.destroy()
+    except Exception:
+        pass
     cv2.destroyAllWindows()
-
-    print(
-
-        "Risk engine stopped."
-
-    )
+    print("[ENV] Camera risk engine stopped.")
